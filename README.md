@@ -21,7 +21,8 @@ The default column layout matches the COITG course-content spreadsheet:
 |---------|---------------|
 | Video URL (input) | **F** |
 | Embed code (output) | **O** |
-| Video duration (output) | **P** |
+| Video duration (output) | **N** |
+| Item unique ID (output) | **P** |
 
 ### Supported file formats
 
@@ -52,7 +53,8 @@ python embed_extractor.py <spreadsheet> [options]
 |--------|---------|-------------|
 | `--url-col COL` | `F` | Column that contains the video URLs. |
 | `--embed-col COL` | `O` | Column where the embed code will be written. |
-| `--duration-col COL` | `P` | Column where the video duration will be written (e.g. `"4:33"`). Pass `""` to disable. |
+| `--duration-col COL` | `N` | Column where the video duration will be written (e.g. `"4:33"`). Pass `""` to disable. |
+| `--id-col COL` | `P` | Column where a generated UUID will be written for each row. Pass `""` to disable. |
 | `--no-headless` | *(headless)* | Open a visible browser window (useful for debugging). |
 
 `COL` can be:
@@ -67,17 +69,18 @@ python embed_extractor.py <spreadsheet> [options]
 python embed_extractor.py "Excel Course Content for Moodle.xlsx"
 
 # Override columns
-python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 --duration-col 4
+python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 \
+    --duration-col 4 --id-col 5
 
 # Use header names
 python embed_extractor.py videos.csv --url-col "Video URL" \
-    --embed-col "Embed Code" --duration-col "Duration"
+    --embed-col "Embed Code" --duration-col "Duration" --id-col "Item ID"
 
 # Visible browser window for debugging
 python embed_extractor.py videos.xlsx --no-headless
 
-# Disable duration extraction
-python embed_extractor.py videos.xlsx --duration-col ""
+# Disable duration or ID extraction
+python embed_extractor.py videos.xlsx --duration-col "" --id-col ""
 ```
 
 The spreadsheet is **modified in-place**: the embed code and duration are
@@ -87,15 +90,15 @@ written directly into the specified columns and the file is saved.
 
 Before running the script (using default columns):
 
-| … | F (Video URL) | … | O (Embed Code) | P (Duration) |
-|---|--------------|---|----------------|--------------|
-| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | | |
+| … | F (Video URL) | … | N (Duration) | O (Embed Code) | P (Item ID) |
+|---|--------------|---|--------------|----------------|-------------|
+| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | | | |
 
 After running `python embed_extractor.py sheet.xlsx`:
 
-| … | F (Video URL) | … | O (Embed Code) | P (Duration) |
-|---|--------------|---|----------------|--------------|
-| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | `<iframe …></iframe>` | `3:33` |
+| … | F (Video URL) | … | N (Duration) | O (Embed Code) | P (Item ID) |
+|---|--------------|---|--------------|----------------|-------------|
+| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | `3:33` | `<iframe …></iframe>` | `a1b2c3d4-…` |
 
 ### Running the tests
 

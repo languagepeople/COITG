@@ -11,6 +11,7 @@ import csv
 import os
 import sys
 import tempfile
+import uuid as _uuid_module
 from unittest.mock import patch
 
 import pytest
@@ -280,6 +281,42 @@ class TestProcessCsv:
         finally:
             os.unlink(path)
 
+    def test_item_id_written_to_column(self):
+        path = self._make_csv(
+            [["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],
+            headers=["URL"],
+        )
+        try:
+            ee.process_csv(path, "1", "2", headless=True, id_col="3")
+
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f))
+
+            item_id = rows[1][2]
+            assert item_id  # non-empty
+            # Should be a valid UUID
+            _uuid_module.UUID(item_id)  # raises ValueError if not a valid UUID
+        finally:
+            os.unlink(path)
+
+    def test_item_id_not_written_for_empty_url(self):
+        path = self._make_csv(
+            [[""], ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],
+            headers=["URL"],
+        )
+        try:
+            ee.process_csv(path, "1", "2", headless=True, id_col="3")
+
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f))
+
+            # Empty-URL row should have no ID
+            assert rows[1][2] == ""
+            # YouTube row should have an ID
+            assert rows[2][2]
+        finally:
+            os.unlink(path)
+
 
 # ---------------------------------------------------------------------------
 # process_excel  (end-to-end with a temp .xlsx, no browser)
@@ -356,5 +393,24 @@ class TestProcessExcel:
             assert embed is not None
             assert "<iframe" in embed
             assert duration == "4:33"
+        finally:
+            os.unlink(path)
+
+    def test_item_id_written_to_column(self):
+        import openpyxl
+
+        path = self._make_xlsx(
+            [["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],
+            headers=["URL"],
+        )
+        try:
+            ee.process_excel(path, "1", "2", headless=True, id_col="3")
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            item_id = ws.cell(row=2, column=3).value
+            assert item_id  # non-empty
+            # Should be a valid UUID
+            _uuid_module.UUID(item_id)  # raises ValueError if not a valid UUID
         finally:
             os.unlink(path)

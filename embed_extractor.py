@@ -15,7 +15,8 @@ automation is blocked or the page layout has changed.
 Default columns match the COITG course-content spreadsheet:
     --url-col  F   (column containing the YouTube / video links)
     --embed-col O  (column to receive the <iframe> embed HTML)
-    --duration-col P  (column to receive the video duration, e.g. "4:33")
+    --duration-col N  (column to receive the video duration, e.g. "4:33")
+    --id-col P  (column to receive a generated UUID for each row)
 
 Usage
 -----
@@ -23,15 +24,16 @@ Usage
 
 Examples
 --------
-    # Use default columns F (URL), O (embed), P (duration)
+    # Use default columns F (URL), O (embed), N (duration), P (UUID)
     python embed_extractor.py "Course Content.xlsx"
 
     # Override any column by number, letter, or header name
-    python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 --duration-col 4
+    python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 \\
+        --duration-col 4 --id-col 5
 
     # URL column by header name, output to named columns
     python embed_extractor.py videos.csv --url-col "Video URL" \\
-        --embed-col "Embed Code" --duration-col "Duration"
+        --embed-col "Embed Code" --duration-col "Duration" --id-col "Item ID"
 
     # Keep the browser window visible (non-headless) for debugging
     python embed_extractor.py videos.xlsx --no-headless
@@ -44,6 +46,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -473,6 +476,7 @@ def process_excel(
     embed_col: str,
     headless: bool,
     duration_col: str | None = None,
+    id_col: str | None = None,
 ) -> None:
     if not _OPENPYXL_AVAILABLE:
         sys.exit("openpyxl is not installed.  Run: pip install -r requirements.txt")
@@ -488,6 +492,11 @@ def process_excel(
     if duration_col:
         dur_idx = _col_index(ws, duration_col)
         _ensure_header(ws, dur_idx, header="Duration")
+
+    item_id_idx: int | None = None
+    if id_col:
+        item_id_idx = _col_index(ws, id_col)
+        _ensure_header(ws, item_id_idx, header="Item ID")
 
     driver = _create_driver(headless)
     max_row = ws.max_row
@@ -510,6 +519,10 @@ def process_excel(
                     print(f"  → duration: {duration}")
                 else:
                     print(f"  → duration not found", file=sys.stderr)
+            if item_id_idx is not None:
+                item_id = str(uuid.uuid4())
+                ws.cell(row=row_num, column=item_id_idx, value=item_id)
+                print(f"  → item ID: {item_id}")
     finally:
         if driver:
             driver.quit()
@@ -561,6 +574,7 @@ def process_csv(
     embed_col: str,
     headless: bool,
     duration_col: str | None = None,
+    id_col: str | None = None,
 ) -> None:
     # Read all rows
     with open(path, newline="", encoding="utf-8-sig") as f:
@@ -601,11 +615,30 @@ def process_csv(
                 while len(row) <= dur_idx:
                     row.append("")
 
+    # Resolve item ID column; add header if needed
+    item_id_idx: int | None = None
+    if id_col:
+        try:
+            item_id_idx = _col_index_csv(headers, id_col)
+        except ValueError:
+            item_id_idx = None
+        if item_id_idx is None or item_id_idx >= len(headers):
+            item_id_idx = len(headers)
+            headers.append(id_col if not id_col.isdigit() else "Item ID")
+            for row in rows[1:]:
+                while len(row) <= item_id_idx:
+                    row.append("")
+
     driver = _create_driver(headless)
 
     try:
         for i, row in enumerate(rows[1:], start=2):
-            needed = max(url_idx, embed_idx, dur_idx if dur_idx is not None else 0)
+            needed = max(
+                url_idx,
+                embed_idx,
+                dur_idx if dur_idx is not None else 0,
+                item_id_idx if item_id_idx is not None else 0,
+            )
             while len(row) <= needed:
                 row.append("")
             url = row[url_idx].strip()
@@ -624,6 +657,10 @@ def process_csv(
                     print(f"  → duration: {duration}")
                 else:
                     print(f"  → duration not found", file=sys.stderr)
+            if item_id_idx is not None:
+                item_id = str(uuid.uuid4())
+                row[item_id_idx] = item_id
+                print(f"  → item ID: {item_id}")
     finally:
         if driver:
             driver.quit()
@@ -713,12 +750,23 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--duration-col",
-        default="P",
+        default="N",
         metavar="COL",
         help=(
             "Column where video duration will be written (e.g. '4:33'). "
             "Same format as --url-col. "
             "Set to empty string to disable duration extraction. "
+            "Default: N"
+        ),
+    )
+    parser.add_argument(
+        "--id-col",
+        default="P",
+        metavar="COL",
+        help=(
+            "Column where a generated UUID will be written for each row. "
+            "Same format as --url-col. "
+            "Set to empty string to disable ID generation. "
             "Default: P"
         ),
     )
@@ -740,6 +788,7 @@ def main(argv=None) -> int:
 
     headless = not args.no_headless
     duration_col = args.duration_col or None  # empty string → None (disabled)
+    id_col = args.id_col or None  # empty string → None (disabled)
     ext = os.path.splitext(path)[1].lower()
 
     if ext in (".xlsx", ".xls"):
@@ -750,10 +799,10 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
             return 1
-        process_excel(path, args.url_col, args.embed_col, headless, duration_col)
+        process_excel(path, args.url_col, args.embed_col, headless, duration_col, id_col)
 
     elif ext == ".csv":
-        process_csv(path, args.url_col, args.embed_col, headless, duration_col)
+        process_csv(path, args.url_col, args.embed_col, headless, duration_col, id_col)
 
     else:
         print(
