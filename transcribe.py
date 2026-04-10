@@ -49,7 +49,7 @@ def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(
         [
             "yt-dlp",
-            "--print", "%(title)s\t%(duration)s",
+            "--print", "%{title}\t%{duration}s",
             "--no-playlist",
             url,
         ],
@@ -205,10 +205,13 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
     wb = load_workbook(xlsx_path)
     ws = wb.active
 
+    # Column F is index 5 (zero-based)
+    URL_COL = 5
+
     rows = [
-        (i + 1, str(row[0].value).strip())
+        (i + 1, str(row[URL_COL].value).strip())
         for i, row in enumerate(ws.iter_rows())
-        if row[0].value and str(row[0].value).strip().startswith("http")
+        if row[URL_COL].value and str(row[URL_COL].value).strip().startswith("http")
     ]
 
     if not rows:
@@ -350,7 +353,7 @@ def main():
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column A.")
+    group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column F.")
     group.add_argument("--directory", "-d", help="Path to a directory of audio files to transcribe.")
 
     parser.add_argument("--audio-dir", "-a", default="./audio", help="Where to save downloaded audio. (default: ./audio)")
