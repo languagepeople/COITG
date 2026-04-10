@@ -201,15 +201,29 @@ def process_audio_file(audio_path: str, output_dir: str, model, skip_existing: b
     write_log(log_path, log_entry)
     return True
 
-def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, skip_existing: bool, log_path: str):
+def process_spreadsheet(
+    xlsx_path: str,
+    audio_dir: str,
+    output_dir: str,
+    model,
+    skip_existing: bool,
+    log_path: str,
+    audio_base_url: str = "https://yoursite.com/audio/",
+    embed_only: bool = False,
+):
     wb = load_workbook(xlsx_path)
     ws = wb.active
 
-    rows = [
-        (i + 1, str(row[0].value).strip())
-        for i, row in enumerate(ws.iter_rows())
-        if row[0].value and str(row[0].value).strip().startswith("http")
-    ]
+    # Collect rows that have a URL in column F (1-based index 6)
+    rows = []
+    for row_num in range(2, ws.max_row + 1):  # skip header row 1
+        url_cell = ws.cell(row=row_num, column=6)  # column F
+        if not url_cell.value:
+            continue
+        url = str(url_cell.value).strip()
+        if not url.startswith("http"):
+            continue
+        rows.append((row_num, url))
 
     if not rows:
         print("No URLs found in the spreadsheet.")
@@ -218,6 +232,7 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
     total = len(rows)
     print(f"\nFound {total} URL(s) in spreadsheet. Starting...\n")
 
+    base_url = audio_base_url.rstrip("/")
     failed = []
 
     for row_num, url in rows:
@@ -259,8 +274,8 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
         print(f"    Title    : {title}")
         print(f"    Duration : {format_duration(duration)}")
 
-        # Step 2: Skip if transcript already exists
-        if skip_existing and os.path.exists(output_path):
+        # Step 2: Skip if transcript already exists (skipped in embed-only mode)
+        if not embed_only and skip_existing and os.path.exists(output_path):
             print(f"    Skipping — transcript already exists.\n")
             log_entry["status"] = "skipped"
             write_log(log_path, log_entry)
@@ -278,6 +293,21 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
         else:
             print(f"    Audio already on disk, skipping download.")
 
+        # Build the <audio> embed tag and write to column Q (1-based index 17)
+        filename = f"{sanitize_filename(title)}.mp3"
+        embed_html = (
+            f'<audio controls>\n'
+            f'  <source src="{base_url}/{filename}" type="audio/mpeg">\n'
+            f'</audio>'
+        )
+        ws.cell(row=row_num, column=17, value=embed_html)
+
+        if embed_only:
+            log_entry["status"] = "success"
+            write_log(log_path, log_entry)
+            print(f"    ✓ Embed written (embed-only mode).\n")
+            continue
+
         # Step 4: Transcribe and save
         sentences = transcribe_audio(audio_path, model)
         if not sentences:
@@ -292,6 +322,9 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
         log_entry["status"] = "success"
         write_log(log_path, log_entry)
         print(f"    ✓ Done.\n")
+
+    # Save workbook with updated column Q values
+    wb.save(xlsx_path)
 
     # Summary
     print("\n" + "=" * 50)
@@ -350,7 +383,7 @@ def main():
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column A.")
+    group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column F.")
     group.add_argument("--directory", "-d", help="Path to a directory of audio files to transcribe.")
 
     parser.add_argument("--audio-dir", "-a", default="./audio", help="Where to save downloaded audio. (default: ./audio)")
@@ -358,6 +391,16 @@ def main():
     parser.add_argument("--log-file", "-l", default="./transcription_log.txt", help="Path to the log file. (default: ./transcription_log.txt)")
     parser.add_argument("--model", "-m", default="medium", choices=["tiny", "base", "small", "medium", "large"], help="Whisper model size. (default: medium)")
     parser.add_argument("--no-skip", action="store_true", help="Re-transcribe even if a .docx already exists.")
+    parser.add_argument(
+        "--audio-base-url",
+        default="https://yoursite.com/audio/",
+        help="Base URL where .mp3 files will be hosted. Used to construct the <audio> embed src. (default: https://yoursite.com/audio/)",
+    )
+    parser.add_argument(
+        "--embed-only",
+        action="store_true",
+        help="Skip Whisper transcription entirely. Only download audio and write the <audio> embed tag to column Q.",
+    )
 
     args = parser.parse_args()
 
@@ -376,11 +419,23 @@ def main():
         f.write(f"  Skip existing: {not args.no_skip}\n")
         f.write("═" * 60 + "\n")
 
-    print(f"Loading Whisper model '{args.model}'...")
-    model = whisper.load_model(args.model)
+    if args.embed_only:
+        model = None
+    else:
+        print(f"Loading Whisper model '{args.model}'...")
+        model = whisper.load_model(args.model)
 
     if args.spreadsheet:
-        process_spreadsheet(args.spreadsheet, args.audio_dir, args.output_dir, model, not args.no_skip, args.log_file)
+        process_spreadsheet(
+            args.spreadsheet,
+            args.audio_dir,
+            args.output_dir,
+            model,
+            not args.no_skip,
+            args.log_file,
+            audio_base_url=args.audio_base_url,
+            embed_only=args.embed_only,
+        )
     elif args.directory:
         process_directory(args.directory, args.output_dir, model, not args.no_skip, args.log_file)
 
