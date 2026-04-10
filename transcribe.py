@@ -4,11 +4,12 @@ import argparse
 import re
 import json
 import nltk
-import whisper
+import torch
 from datetime import datetime
 from docx import Document
 from openpyxl import load_workbook
 from pathlib import Path
+from faster_whisper import WhisperModel, BatchedInferencePipeline
 
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
@@ -49,7 +50,7 @@ def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(
         [
             "yt-dlp",
-            "--print", "%{title}\t%{duration}s",
+            "--print", "%{title}s\t%{duration}s",
             "--no-playlist",
             url,
         ],
@@ -89,26 +90,73 @@ def download_audio(url: str, output_path: str) -> bool:
         return False
     return True
 
-def transcribe_audio(audio_path: str, model) -> list[dict]:
+# ── Model Loading ─────────────────────────────────────────────────────────────
+
+def load_model(model_size: str, batch_size: int) -> tuple:
+    """
+    Load faster-whisper with BatchedInferencePipeline on CUDA.
+
+    - compute_type="float16" : best speed/accuracy balance on NVIDIA GPUs
+    - BatchedInferencePipeline: processes multiple audio chunks in parallel
+      on the GPU, giving a 2-4x speed boost over sequential inference.
+    - vad_filter: Voice Activity Detection — skips silent sections entirely,
+      reducing wasted compute on gaps, music, or silence.
+
+    Returns (pipeline, batch_size) tuple.
+    """
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+
+    print(f"  Device       : {device.upper()}")
+    print(f"  Compute type : {compute_type}")
+    print(f"  Batch size   : {batch_size}")
+
+    if device == "cpu":
+        print("  WARNING: CUDA not detected — falling back to CPU. This will be much slower.")
+
+    base_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    pipeline = BatchedInferencePipeline(model=base_model)
+    return pipeline, batch_size
+
+# ── Transcription ─────────────────────────────────────────────────────────────
+
+def transcribe_audio(audio_path: str, pipeline: BatchedInferencePipeline, batch_size: int) -> list[dict]:
+    """
+    Transcribe audio using batched inference pipeline.
+
+    vad_filter=True        : skip silence/non-speech, speeds up processing
+    word_timestamps=True   : get per-word timing for accurate sentence stamps
+    batch_size             : number of chunks processed in parallel on GPU
+    """
     print(f"    Transcribing...")
-    result = model.transcribe(audio_path, word_timestamps=True)
+
+    segments, _ = pipeline.transcribe(
+        audio_path,
+        word_timestamps=True,
+        vad_filter=True,
+        vad_parameters=dict(
+            min_speech_duration_ms=250,   # ignore speech bursts shorter than 250ms
+            min_silence_duration_ms=500,  # merge segments separated by <500ms silence
+        ),
+        batch_size=batch_size,
+    )
 
     sentences_with_times = []
-    for segment in result["segments"]:
-        text = segment["text"].strip()
+    for segment in segments:
+        text = segment.text.strip()
         if not text:
             continue
 
         sentences = sent_tokenize(text)
-        words = segment.get("words", [])
+        words = list(segment.words) if segment.words else []
         word_idx = 0
 
         for sentence in sentences:
             word_count = len(sentence.split())
             sentence_words = words[word_idx : word_idx + word_count]
 
-            start = sentence_words[0]["start"] if sentence_words else segment["start"]
-            end = sentence_words[-1]["end"] if sentence_words else segment["end"]
+            start = sentence_words[0].start if sentence_words else segment.start
+            end = sentence_words[-1].end if sentence_words else segment.end
 
             sentences_with_times.append({
                 "sentence": sentence,
@@ -118,6 +166,8 @@ def transcribe_audio(audio_path: str, model) -> list[dict]:
             word_idx += word_count
 
     return sentences_with_times
+
+# ── Output ────────────────────────────────────────────────────────────────────
 
 def save_docx(sentences: list[dict], output_path: str, source_name: str):
     doc = Document()
@@ -134,17 +184,12 @@ def save_docx(sentences: list[dict], output_path: str, source_name: str):
     doc.save(output_path)
     print(f"    Saved: {output_path}")
 
-
 # ── Logging ───────────────────────────────────────────────────────────────────
 
 def write_log(log_path: str, entry: dict):
     """
-    Append a single job entry to the log file.
-
-    Each entry is a JSON object on its own line (newline-delimited JSON / NDJSON),
-    making it easy to parse programmatically while still being human-readable.
-
-    A human-readable text block is written above each JSON line as a comment.
+    Append a single job entry to the log file in both human-readable
+    and machine-readable (JSON) formats.
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry["logged_at"] = timestamp
@@ -163,10 +208,17 @@ def write_log(log_path: str, entry: dict):
             f.write(f"  Error      : {entry['error']}\n")
         f.write(f"  JSON       : {json.dumps(entry)}\n")
 
-
 # ── Core Processing ───────────────────────────────────────────────────────────
 
-def process_audio_file(audio_path: str, output_dir: str, model, skip_existing: bool, log_path: str, url: str = "N/A"):
+def process_audio_file(
+    audio_path: str,
+    output_dir: str,
+    pipeline: BatchedInferencePipeline,
+    batch_size: int,
+    skip_existing: bool,
+    log_path: str,
+    url: str = "N/A",
+) -> bool:
     """Transcribe a single local audio file and save as .docx."""
     stem = Path(audio_path).stem
     output_path = os.path.join(output_dir, f"{stem}.docx")
@@ -188,7 +240,7 @@ def process_audio_file(audio_path: str, output_dir: str, model, skip_existing: b
         write_log(log_path, log_entry)
         return True
 
-    sentences = transcribe_audio(audio_path, model)
+    sentences = transcribe_audio(audio_path, pipeline, batch_size)
     if not sentences:
         print(f"    WARNING: Empty transcription.")
         log_entry["status"] = "failed"
@@ -201,7 +253,16 @@ def process_audio_file(audio_path: str, output_dir: str, model, skip_existing: b
     write_log(log_path, log_entry)
     return True
 
-def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, skip_existing: bool, log_path: str):
+
+def process_spreadsheet(
+    xlsx_path: str,
+    audio_dir: str,
+    output_dir: str,
+    pipeline: BatchedInferencePipeline,
+    batch_size: int,
+    skip_existing: bool,
+    log_path: str,
+):
     wb = load_workbook(xlsx_path)
     ws = wb.active
 
@@ -215,7 +276,7 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
     ]
 
     if not rows:
-        print("No URLs found in the spreadsheet.")
+        print("No URLs found in column F of the spreadsheet.")
         return
 
     total = len(rows)
@@ -282,7 +343,7 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
             print(f"    Audio already on disk, skipping download.")
 
         # Step 4: Transcribe and save
-        sentences = transcribe_audio(audio_path, model)
+        sentences = transcribe_audio(audio_path, pipeline, batch_size)
         if not sentences:
             print(f"    WARNING: Empty transcription.")
             log_entry["status"] = "failed"
@@ -308,7 +369,14 @@ def process_spreadsheet(xlsx_path: str, audio_dir: str, output_dir: str, model, 
     print("=" * 50)
     print(f"\nLog written to: {log_path}")
 
-def process_directory(audio_dir: str, output_dir: str, model, skip_existing: bool, log_path: str):
+def process_directory(
+    audio_dir: str,
+    output_dir: str,
+    pipeline: BatchedInferencePipeline,
+    batch_size: int,
+    skip_existing: bool,
+    log_path: str,
+):
     extensions = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
     files = sorted([
         f for f in Path(audio_dir).iterdir()
@@ -327,7 +395,7 @@ def process_directory(audio_dir: str, output_dir: str, model, skip_existing: boo
     for i, audio_file in enumerate(files, 1):
         print(f"[{i}/{total}] {audio_file.name}")
         success = process_audio_file(
-            str(audio_file), output_dir, model, skip_existing, log_path
+            str(audio_file), output_dir, pipeline, batch_size, skip_existing, log_path
         )
         if not success:
             failed.append(audio_file.name)
@@ -344,12 +412,11 @@ def process_directory(audio_dir: str, output_dir: str, model, skip_existing: boo
     print("=" * 50)
     print(f"\nLog written to: {log_path}")
 
-
 # ── CLI Entry Point ───────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="YouTube Audio Transcriber → DOCX with timestamps"
+        description="YouTube Audio Transcriber → DOCX with timestamps (faster-whisper + CUDA)"
     )
 
     group = parser.add_mutually_exclusive_group(required=True)
@@ -359,7 +426,16 @@ def main():
     parser.add_argument("--audio-dir", "-a", default="./audio", help="Where to save downloaded audio. (default: ./audio)")
     parser.add_argument("--output-dir", "-o", default="./transcripts", help="Where to save .docx files. (default: ./transcripts)")
     parser.add_argument("--log-file", "-l", default="./transcription_log.txt", help="Path to the log file. (default: ./transcription_log.txt)")
-    parser.add_argument("--model", "-m", default="medium", choices=["tiny", "base", "small", "medium", "large"], help="Whisper model size. (default: medium)")
+    parser.add_argument(
+        "--model", "-m", default="large-v2",
+        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
+        help="Whisper model size. (default: large-v2)"
+    )
+    parser.add_argument(
+        "--batch-size", "-b", type=int, default=16,
+        help="Number of audio chunks processed in parallel on GPU. "
+             "Reduce if you run out of VRAM. (default: 16)"
+    )
     parser.add_argument("--no-skip", action="store_true", help="Re-transcribe even if a .docx already exists.")
 
     args = parser.parse_args()
@@ -367,7 +443,7 @@ def main():
     os.makedirs(args.audio_dir, exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Write a session header to the log
+    # Write session header to log
     with open(args.log_file, "a", encoding="utf-8") as f:
         f.write("\n" + "═" * 60 + "\n")
         f.write(f"  SESSION START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -376,16 +452,17 @@ def main():
         f.write(f"  Audio dir    : {Path(args.audio_dir).resolve()}\n")
         f.write(f"  Output dir   : {Path(args.output_dir).resolve()}\n")
         f.write(f"  Whisper model: {args.model}\n")
+        f.write(f"  Batch size   : {args.batch_size}\n")
         f.write(f"  Skip existing: {not args.no_skip}\n")
         f.write("═" * 60 + "\n")
 
-    print(f"Loading Whisper model '{args.model}'...")
-    model = whisper.load_model(args.model)
+    print(f"Loading faster-whisper model '{args.model}'...")
+    pipeline, batch_size = load_model(args model, args.batch_size)
 
     if args.spreadsheet:
-        process_spreadsheet(args.spreadsheet, args.audio_dir, args.output_dir, model, not args.no_skip, args.log_file)
+        process_spreadsheet(args.spreadsheet, args.audio_dir, args.output_dir, pipeline, batch_size, not args.no_skip, args.log_file)
     elif args.directory:
-        process_directory(args.directory, args.output_dir, model, not args.no_skip, args.log_file)
+        process_directory(args.directory, args.output_dir, pipeline, batch_size, not args.no_skip, args.log_file)
 
 
 if __name__ == "__main__":
