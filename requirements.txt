@@ -1,0 +1,6 @@
+yt-dlp
+openai-whisper
+python-docx
+openpyxl
+nltk
+torch
