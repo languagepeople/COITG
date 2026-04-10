@@ -5,6 +5,8 @@ import re
 import json
 import threading
 import queue
+import signal
+import sys
 import nltk
 import torch
 from datetime import datetime
@@ -16,6 +18,24 @@ from faster_whisper import WhisperModel, BatchedInferencePipeline
 nltk.download("punkt", quiet=True)
 nltk.download("punkt_tab", quiet=True)
 from nltk.tokenize import sent_tokenize
+
+
+# -- Graceful shutdown --------------------------------------------------------
+# A single global Event. Any part of the code can check _stop.is_set() to
+# know that the user pressed CTRL+C and we should stop after the current task.
+
+_stop = threading.Event()
+
+def _handle_sigint(sig, frame):
+    if not _stop.is_set():
+        print("\n\n  [!] CTRL+C detected -- finishing current transcription then stopping.")
+        print("      Press CTRL+C again to force-quit immediately.\n")
+        _stop.set()
+    else:
+        print("\n  [!] Force-quitting.")
+        sys.exit(1)
+
+signal.signal(signal.SIGINT, _handle_sigint)
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -72,21 +92,34 @@ def download_audio(url: str, output_path: str):
     return True, None
 
 
+# -- Progress file ------------------------------------------------------------
+# The progress file is a plain JSON object: { "completed_urls": [...] }
+# It lives next to the spreadsheet and is updated every time a video
+# is successfully transcribed (or skipped). On resume, any URL already
+# in this set is skipped automatically.
+
+def load_progress(progress_path: str) -> set:
+    """Return the set of URLs already completed from a previous run."""
+    if not os.path.exists(progress_path):
+        return set()
+    try:
+        with open(progress_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("completed_urls", []))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+def save_progress(progress_path: str, completed_urls: set):
+    """Atomically write the progress file so a crash never corrupts it."""
+    tmp = progress_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"completed_urls": sorted(completed_urls)}, f, indent=2)
+    os.replace(tmp, progress_path)  # atomic on Windows and POSIX
+
+
 # -- Model Loading ------------------------------------------------------------
 
 def load_model(model_size: str, batch_size: int) -> tuple:
-    """
-    Load faster-whisper with BatchedInferencePipeline on CUDA.
-
-    Model is downloaded once and cached permanently at:
-      C:\\Users\\<you>\\.cache\\huggingface\\hub\\
-    All subsequent runs load from disk with no re-download.
-
-    - compute_type="float16" : best speed/accuracy on NVIDIA CUDA GPUs
-    - BatchedInferencePipeline: processes multiple audio chunks in parallel
-      on the GPU, giving a 2-4x speed boost over sequential inference.
-    - vad_filter: skips silent sections to reduce wasted compute.
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     compute_type = "float16" if device == "cuda" else "int8"
 
@@ -178,27 +211,21 @@ def write_log(log_path: str, entry: dict):
 _DONE = object()
 
 def _downloader_thread(jobs, audio_dir, log_path, ready_queue):
-    """
-    Background thread: downloads audio for each job and puts a work item
-    onto ready_queue for the main thread to transcribe.
-
-    The queue is bounded so the downloader stays at most `prefetch` videos
-    ahead of the transcriber -- preventing disk from filling up.
-    """
     for row_num, url, meta in jobs:
+        if _stop.is_set():
+            break
+
         title      = meta["title"]
         duration   = meta["duration"]
         audio_path = os.path.join(audio_dir, f"{title}.mp3")
 
         log_base = {
-            "url": url,
-            "title": title,
+            "url": url, "title": title,
             "audio_path": str(Path(audio_path).resolve()),
             "transcript_path": None,
             "duration_raw": duration,
             "duration_readable": format_duration(duration),
-            "status": None,
-            "error": None,
+            "status": None, "error": None,
         }
 
         if os.path.exists(audio_path):
@@ -226,21 +253,16 @@ def _downloader_thread(jobs, audio_dir, log_path, ready_queue):
 
 def process_spreadsheet_pipelined(
     xlsx_path, audio_dir, output_dir, pipeline, batch_size,
-    skip_existing, log_path, prefetch=3
+    skip_existing, log_path, progress_path, prefetch=3
 ):
-    """
-    Pipelined spreadsheet processing:
-      - A background thread downloads audio files (up to `prefetch` ahead).
-      - The main thread transcribes each file as soon as it is ready.
-      - Net effect: GPU is almost never idle waiting for a download.
-
-    prefetch=3 means up to 3 audio files sit on disk waiting to be
-    transcribed. Increase if your internet is faster than your GPU;
-    decrease if you are short on disk space.
-    """
     wb = load_workbook(xlsx_path)
     ws = wb.active
     URL_COL = 5  # Column F (zero-based)
+
+    # Load previously completed URLs
+    completed_urls = load_progress(progress_path)
+    if completed_urls:
+        print(f"  Resuming -- {len(completed_urls)} URL(s) already completed (from progress file).\n")
 
     print("Scanning spreadsheet and fetching metadata...")
     jobs   = []
@@ -260,6 +282,10 @@ def process_spreadsheet_pipelined(
     print(f"Found {total_rows} URL(s). Fetching metadata...\n")
 
     for row_num, url in raw_rows:
+        if url in completed_urls:
+            print(f"  [RESUME] Row {row_num}: already completed -- skipping.")
+            continue
+
         meta = get_video_metadata(url)
         if not meta:
             print(f"  [META] Row {row_num}: Could not fetch metadata -- {url}")
@@ -276,6 +302,8 @@ def process_spreadsheet_pipelined(
 
         if skip_existing and os.path.exists(output_path):
             print(f"  [SKIP] Row {row_num}: {title}")
+            completed_urls.add(url)
+            save_progress(progress_path, completed_urls)
             write_log(log_path, {
                 "url": url, "title": title,
                 "audio_path": str(Path(os.path.join(audio_dir, f"{title}.mp3")).resolve()),
@@ -289,14 +317,15 @@ def process_spreadsheet_pipelined(
         jobs.append((row_num, url, meta))
 
     if not jobs:
-        print("\nNothing left to process (all skipped or failed metadata).")
-        _print_summary(total_rows, failed, log_path)
+        print("\nNothing left to process (all skipped, resumed, or failed metadata).")
+        _print_summary(total_rows, failed, log_path, progress_path)
         return
 
     total_to_process = len(jobs)
     print(f"\n{total_to_process} video(s) to download and transcribe.")
     print("Starting pipelined download + transcription...")
-    print("  [DL] = downloader thread      [TX] = transcriber (GPU)\n")
+    print("  [DL] = downloader thread      [TX] = transcriber (GPU)")
+    print("  Press CTRL+C once to stop gracefully after current video.\n")
 
     ready_queue = queue.Queue(maxsize=prefetch)
     dl_thread = threading.Thread(
@@ -307,9 +336,16 @@ def process_spreadsheet_pipelined(
     dl_thread.start()
 
     completed = 0
+    stopped_early = False
+
     while True:
         item = ready_queue.get()
         if item is _DONE:
+            break
+
+        if _stop.is_set():
+            print("\n  [!] Stopping after current item. Run the same command to resume.")
+            stopped_early = True
             break
 
         row_num, url, meta = item["job"]
@@ -340,13 +376,25 @@ def process_spreadsheet_pipelined(
         save_docx(sentences, output_path, title)
         log_base["status"] = "success"
         write_log(log_path, log_base)
+
+        # Mark this URL as complete in the progress file immediately
+        completed_urls.add(url)
+        save_progress(progress_path, completed_urls)
+
         print(f"  [TX] Done: {output_path}\n")
 
-    dl_thread.join()
-    _print_summary(total_rows, failed, log_path)
+    dl_thread.join(timeout=2)
+
+    if stopped_early:
+        remaining = total_to_process - completed
+        print(f"  Stopped with {remaining} video(s) remaining.")
+        print(f"  Progress saved to: {progress_path}")
+        print(f"  Run the same command again to resume from where you left off.\n")
+
+    _print_summary(total_rows, failed, log_path, progress_path)
 
 
-def _print_summary(total, failed, log_path):
+def _print_summary(total, failed, log_path, progress_path=None):
     print("\n" + "=" * 50)
     print(f"Completed: {total - len(failed)}/{total}")
     if failed:
@@ -356,10 +404,13 @@ def _print_summary(total, failed, log_path):
     else:
         print("All rows completed successfully.")
     print("=" * 50)
-    print(f"\nLog written to: {log_path}")
+    print(f"\nLog written to   : {log_path}")
+    if progress_path:
+        print(f"Progress file    : {progress_path}")
 
 
 # -- Directory mode -----------------------------------------------------------
+
 def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing, log_path):
     extensions = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
     files = sorted([f for f in Path(audio_dir).iterdir()
@@ -371,6 +422,9 @@ def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing
     print(f"\nFound {total} audio file(s). Starting...\n")
     failed = []
     for i, audio_file in enumerate(files, 1):
+        if _stop.is_set():
+            print("\n  [!] Stopping. Re-run the same command to continue from where you left off.")
+            break
         stem        = audio_file.stem
         output_path = os.path.join(output_dir, f"{stem}.docx")
         print(f"[{i}/{total}] {audio_file.name}")
@@ -413,9 +467,10 @@ def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing
 
 
 # -- CLI Entry Point ----------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
-        description="YouTube Audio Transcriber -> DOCX with timestamps (faster-whisper + CUDA, pipelined)"
+        description="YouTube Audio Transcriber -> DOCX with timestamps (faster-whisper + CUDA, pipelined, resumable)"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column F.")
@@ -426,19 +481,36 @@ def main():
                         help="Where to save .docx files. (default: ./transcripts)")
     parser.add_argument("--log-file",   "-l", default="./transcription_log.txt",
                         help="Path to the log file. (default: ./transcription_log.txt)")
+    parser.add_argument("--progress-file", default=None,
+                        help="Path to the progress/resume JSON file. "
+                             "Defaults to <spreadsheet>.progress.json next to the spreadsheet.")
     parser.add_argument("--model", "-m", default="large-v2",
                         choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
                         help="Whisper model size. (default: large-v2)")
     parser.add_argument("--batch-size", "-b", type=int, default=16,
-                        help="GPU chunks processed in parallel. Reduce if you run out of VRAM. (default: 16)")
+                        help="GPU chunks processed in parallel. Reduce if out of VRAM. (default: 16)")
     parser.add_argument("--prefetch", "-p", type=int, default=3,
                         help="Audio files to download ahead of transcription. (default: 3)")
     parser.add_argument("--no-skip", action="store_true",
                         help="Re-transcribe even if a .docx already exists.")
+    parser.add_argument("--reset-progress", action="store_true",
+                        help="Delete the progress file and start from scratch.")
 
     args = parser.parse_args()
     os.makedirs(args.audio_dir,  exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    # Determine progress file path
+    if args.progress_file:
+        progress_path = args.progress_file
+    elif args.spreadsheet:
+        progress_path = str(Path(args.spreadsheet).with_suffix(".progress.json"))
+    else:
+        progress_path = "./transcription.progress.json"
+
+    if args.reset_progress and os.path.exists(progress_path):
+        os.remove(progress_path)
+        print(f"  Progress file deleted -- starting from scratch.\n")
 
     with open(args.log_file, "a", encoding="utf-8") as f:
         f.write("\n" + "=" * 60 + "\n")
@@ -451,6 +523,7 @@ def main():
         f.write(f"  Batch size   : {args.batch_size}\n")
         f.write(f"  Prefetch     : {args.prefetch}\n")
         f.write(f"  Skip existing: {not args.no_skip}\n")
+        f.write(f"  Progress file: {progress_path}\n")
         f.write("=" * 60 + "\n")
 
     print(f"Loading faster-whisper model '{args.model}'...")
@@ -460,7 +533,7 @@ def main():
         process_spreadsheet_pipelined(
             args.spreadsheet, args.audio_dir, args.output_dir,
             pipeline, batch_size, not args.no_skip, args.log_file,
-            prefetch=args.prefetch,
+            progress_path, prefetch=args.prefetch,
         )
     elif args.directory:
         process_directory(
