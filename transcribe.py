@@ -65,7 +65,7 @@ def sanitize_filename(name: str) -> str:
 
 def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(
-        ["yt-dlp", "--print", "%{title}\t%{duration}", "--no-playlist", url],
+        ["yt-dlp", "--print", "%(title)s\t%(duration)s", "--no-playlist", url],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
