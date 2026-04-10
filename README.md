@@ -18,7 +18,7 @@ YouTube embed code programmatically from the video ID.
 
 | Format | Extension |
 |--------|-----------|
-| Excel (xlsx / xlsb) | `.xlsx`, `.xls` |
+| Excel | `.xlsx`, `.xls` |
 | CSV | `.csv` |
 
 ### Requirements

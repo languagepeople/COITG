@@ -26,6 +26,7 @@ Examples
     # Keep the browser window visible (non-headless) for debugging
     python embed_extractor.py videos.xlsx --no-headless
 """
+from __future__ import annotations
 
 import argparse
 import csv
@@ -33,6 +34,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import urlparse
 
 # ---------------------------------------------------------------------------
 # Optional dependency: selenium  (installed via requirements.txt)
@@ -76,6 +78,19 @@ _YT_PATTERNS = [
     r"youtube\.com/embed/([A-Za-z0-9_-]{11})",
     r"youtube\.com/shorts/([A-Za-z0-9_-]{11})",
 ]
+
+_YT_HOSTNAMES = frozenset(
+    {"www.youtube.com", "youtube.com", "m.youtube.com", "youtu.be"}
+)
+
+
+def _is_youtube_url(url: str) -> bool:
+    """Return True only when *url*'s hostname is a known YouTube domain."""
+    try:
+        hostname = urlparse(url).hostname or ""
+        return hostname in _YT_HOSTNAMES
+    except Exception:
+        return False
 
 
 def extract_youtube_id(url: str) -> str | None:
@@ -177,7 +192,7 @@ def get_embed_via_browser(driver: "webdriver.Chrome", url: str) -> str | None:
         driver.get(url)
         _dismiss_consent_dialogs(driver)
 
-        if "youtube.com" in url or "youtu.be" in url:
+        if _is_youtube_url(url):
             return _youtube_share_embed(driver)
 
         # Generic fallback: look for a Share button anywhere on the page
