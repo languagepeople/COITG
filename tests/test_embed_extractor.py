@@ -79,7 +79,58 @@ class TestBuildYoutubeEmbed:
 
 
 # ---------------------------------------------------------------------------
-# _get_embed  (no driver → programmatic fallback)
+# _parse_iso8601_duration
+# ---------------------------------------------------------------------------
+
+
+class TestParseIso8601Duration:
+    def test_minutes_seconds(self):
+        assert ee._parse_iso8601_duration("PT4M33S") == "4:33"
+
+    def test_hours_minutes_seconds(self):
+        assert ee._parse_iso8601_duration("PT1H2M3S") == "1:02:03"
+
+    def test_seconds_only(self):
+        assert ee._parse_iso8601_duration("PT45S") == "0:45"
+
+    def test_minutes_only(self):
+        assert ee._parse_iso8601_duration("PT10M") == "10:00"
+
+    def test_hours_only(self):
+        assert ee._parse_iso8601_duration("PT2H") == "2:00:00"
+
+    def test_days_and_time(self):
+        assert ee._parse_iso8601_duration("P1DT1H") == "25:00:00"
+
+    def test_unrecognised_returns_original(self):
+        assert ee._parse_iso8601_duration("NOT_VALID") == "NOT_VALID"
+
+
+# ---------------------------------------------------------------------------
+# get_video_duration_from_html
+# ---------------------------------------------------------------------------
+
+
+class TestGetVideoDurationFromHtml:
+    def test_standard_meta_tag(self):
+        html = '<meta itemprop="duration" content="PT4M33S">'
+        assert ee.get_video_duration_from_html(html) == "4:33"
+
+    def test_single_quote_meta_tag(self):
+        html = "<meta itemprop='duration' content='PT1H2M3S'>"
+        assert ee.get_video_duration_from_html(html) == "1:02:03"
+
+    def test_content_before_itemprop(self):
+        html = '<meta content="PT10M" itemprop="duration">'
+        assert ee.get_video_duration_from_html(html) == "10:00"
+
+    def test_missing_duration_returns_none(self):
+        html = "<html><body>No duration here</body></html>"
+        assert ee.get_video_duration_from_html(html) is None
+
+
+# ---------------------------------------------------------------------------
+# _get_embed  (no driver → programmatic fallback, backward compat)
 # ---------------------------------------------------------------------------
 
 
@@ -96,14 +147,43 @@ class TestGetEmbedNoDriver:
 
 
 # ---------------------------------------------------------------------------
-# process_csv  (end-to-end with a temp file, no browser)
+# _get_embed_and_duration  (no driver → fallback, duration via mocked network)
+# ---------------------------------------------------------------------------
+
+
+class TestGetEmbedAndDurationNoDriver:
+    def test_returns_embed_and_duration(self, monkeypatch):
+        monkeypatch.setattr(ee, "fetch_youtube_duration", lambda url: "4:33")
+        embed, duration = ee._get_embed_and_duration(
+            None, "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        )
+        assert embed is not None
+        assert "<iframe" in embed
+        assert duration == "4:33"
+
+    def test_non_youtube_no_embed_no_duration(self):
+        embed, duration = ee._get_embed_and_duration(
+            None, "https://www.example.com/page"
+        )
+        assert embed is None
+        assert duration is None
+
+
+# ---------------------------------------------------------------------------
+# Fixtures: suppress browser and network calls in integration tests
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture(autouse=True)
-def no_browser(monkeypatch):
-    """Prevent any test from spawning a real browser / downloading ChromeDriver."""
+def no_browser_no_network(monkeypatch):
+    """Prevent any test from spawning a real browser or making network calls."""
     monkeypatch.setattr(ee, "_create_driver", lambda headless=True: None)
+    monkeypatch.setattr(ee, "fetch_youtube_duration", lambda url: None)
+
+
+# ---------------------------------------------------------------------------
+# process_csv  (end-to-end with a temp file, no browser)
+# ---------------------------------------------------------------------------
 
 
 class TestProcessCsv:
@@ -124,7 +204,6 @@ class TestProcessCsv:
             headers=["Video URL"],
         )
         try:
-            # Column 1 = URL, column 2 = embed output
             ee.process_csv(path, "1", "2", headless=True)
 
             with open(path, newline="", encoding="utf-8-sig") as f:
@@ -184,6 +263,23 @@ class TestProcessCsv:
         finally:
             os.unlink(path)
 
+    def test_duration_written_to_third_column(self, monkeypatch):
+        monkeypatch.setattr(ee, "fetch_youtube_duration", lambda url: "3:45")
+        path = self._make_csv(
+            [["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],
+            headers=["URL"],
+        )
+        try:
+            ee.process_csv(path, "1", "2", headless=True, duration_col="3")
+
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f))
+
+            assert "<iframe" in rows[1][1]
+            assert rows[1][2] == "3:45"
+        finally:
+            os.unlink(path)
+
 
 # ---------------------------------------------------------------------------
 # process_excel  (end-to-end with a temp .xlsx, no browser)
@@ -239,5 +335,26 @@ class TestProcessExcel:
             embed = ws.cell(row=2, column=2).value
             assert embed is not None
             assert "<iframe" in embed
+        finally:
+            os.unlink(path)
+
+    def test_duration_written_to_third_column(self, monkeypatch):
+        import openpyxl
+
+        monkeypatch.setattr(ee, "fetch_youtube_duration", lambda url: "4:33")
+        path = self._make_xlsx(
+            [["https://www.youtube.com/watch?v=dQw4w9WgXcQ"]],
+            headers=["URL"],
+        )
+        try:
+            ee.process_excel(path, "1", "2", headless=True, duration_col="3")
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb.active
+            embed = ws.cell(row=2, column=2).value
+            duration = ws.cell(row=2, column=3).value
+            assert embed is not None
+            assert "<iframe" in embed
+            assert duration == "4:33"
         finally:
             os.unlink(path)

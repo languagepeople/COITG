@@ -5,11 +5,17 @@ embed_extractor.py
 Reads a spreadsheet (Excel .xlsx/.xls or CSV), follows URLs found in a
 specified column, navigates each URL in a headless browser, clicks the
 Share → Embed buttons, and writes the resulting <iframe> HTML into a
-configurable output column on the same row.
+configurable output column on the same row.  Optionally also fetches
+the video duration and writes it into a second output column.
 
 YouTube is the primary target.  For YouTube URLs a fast programmatic
 fallback is also included so the script still works even when browser
 automation is blocked or the page layout has changed.
+
+Default columns match the COITG course-content spreadsheet:
+    --url-col  F   (column containing the YouTube / video links)
+    --embed-col O  (column to receive the <iframe> embed HTML)
+    --duration-col P  (column to receive the video duration, e.g. "4:33")
 
 Usage
 -----
@@ -17,11 +23,15 @@ Usage
 
 Examples
 --------
-    # URL in column B (2), embed code written to column C (3)
-    python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3
+    # Use default columns F (URL), O (embed), P (duration)
+    python embed_extractor.py "Course Content.xlsx"
 
-    # URL column by header name, output to a named column
-    python embed_extractor.py videos.csv --url-col "Video URL" --embed-col "Embed Code"
+    # Override any column by number, letter, or header name
+    python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 --duration-col 4
+
+    # URL column by header name, output to named columns
+    python embed_extractor.py videos.csv --url-col "Video URL" \\
+        --embed-col "Embed Code" --duration-col "Duration"
 
     # Keep the browser window visible (non-headless) for debugging
     python embed_extractor.py videos.xlsx --no-headless
@@ -34,7 +44,9 @@ import os
 import re
 import sys
 import time
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 # ---------------------------------------------------------------------------
 # Optional dependency: selenium  (installed via requirements.txt)
@@ -116,6 +128,93 @@ def build_youtube_embed(video_id: str) -> str:
     )
 
 
+def _parse_iso8601_duration(iso: str) -> str:
+    """
+    Convert an ISO 8601 duration string to a human-readable time string.
+
+    Examples:
+        PT4M33S  → "4:33"
+        PT1H2M3S → "1:02:03"
+        PT45S    → "0:45"
+    """
+    m = re.fullmatch(
+        r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?",
+        iso.strip(),
+    )
+    if not m:
+        return iso  # return as-is if unrecognised
+
+    days = int(m.group(1) or 0)
+    hours = int(m.group(2) or 0) + days * 24
+    minutes = int(m.group(3) or 0)
+    seconds = int(m.group(4) or 0)
+
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def get_video_duration_from_html(html: str) -> str | None:
+    """
+    Parse an ISO 8601 duration from YouTube page HTML and return it as a
+    human-readable string (e.g. "4:33"), or None if not found.
+    """
+    # Primary pattern: itemprop= before content=
+    m = re.search(r'itemprop=["\']duration["\'][^>]*content=["\']([^"\']+)["\']', html)
+    if not m:
+        # Alternate pattern: content= before itemprop=
+        m = re.search(r'content=["\']([^"\']+)["\'][^>]*itemprop=["\']duration["\']', html)
+    if m:
+        candidate = m.group(1)
+        if candidate.startswith("P"):
+            return _parse_iso8601_duration(candidate)
+    return None
+
+
+def fetch_youtube_duration(url: str) -> str | None:
+    """
+    Fetch the YouTube page for *url* and return the video duration as a
+    human-readable string (e.g. "4:33"), or None on failure.
+
+    This is the network-based fallback used when a browser is unavailable.
+    """
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        )
+        with urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        return get_video_duration_from_html(html)
+    except (URLError, OSError):
+        return None
+
+
+def get_duration_via_browser(driver: "webdriver.Chrome", url: str) -> str | None:
+    """
+    Extract video duration from a page already loaded in *driver*.
+
+    Tries to read the <meta itemprop="duration"> tag from the page source,
+    then falls back to network fetch via urllib.
+    """
+    try:
+        page_source = driver.page_source
+        duration = get_video_duration_from_html(page_source)
+        if duration:
+            return duration
+    except Exception:
+        pass
+
+    # Network fallback (page may still be accessible)
+    return fetch_youtube_duration(url)
+
+
 # ---------------------------------------------------------------------------
 # Browser automation
 # ---------------------------------------------------------------------------
@@ -180,10 +279,12 @@ def _dismiss_consent_dialogs(driver: "webdriver.Chrome") -> None:
             pass
 
 
-def get_embed_via_browser(driver: "webdriver.Chrome", url: str) -> str | None:
+def get_embed_via_browser(
+    driver: "webdriver.Chrome", url: str
+) -> tuple[str | None, str | None]:
     """
-    Navigate to *url* in *driver*, click Share → Embed, and return the
-    <iframe> HTML string, or None on failure.
+    Navigate to *url* in *driver*, click Share → Embed, and return a
+    ``(embed_html, duration)`` tuple.  Either element may be None on failure.
 
     Currently implements the YouTube share flow.  Other sites can be
     added by extending the dispatch block below.
@@ -192,15 +293,18 @@ def get_embed_via_browser(driver: "webdriver.Chrome", url: str) -> str | None:
         driver.get(url)
         _dismiss_consent_dialogs(driver)
 
-        if _is_youtube_url(url):
-            return _youtube_share_embed(driver)
+        duration = get_duration_via_browser(driver, url)
 
-        # Generic fallback: look for a Share button anywhere on the page
-        return _generic_share_embed(driver)
+        if _is_youtube_url(url):
+            embed = _youtube_share_embed(driver)
+        else:
+            embed = _generic_share_embed(driver)
+
+        return embed, duration
 
     except Exception as exc:
         print(f"  [browser] Error fetching embed for {url}: {exc}", file=sys.stderr)
-        return None
+        return None, None
 
 
 def _youtube_share_embed(driver: "webdriver.Chrome") -> str | None:
@@ -368,6 +472,7 @@ def process_excel(
     url_col: str,
     embed_col: str,
     headless: bool,
+    duration_col: str | None = None,
 ) -> None:
     if not _OPENPYXL_AVAILABLE:
         sys.exit("openpyxl is not installed.  Run: pip install -r requirements.txt")
@@ -379,6 +484,11 @@ def process_excel(
     embed_idx = _col_index(ws, embed_col)
     _ensure_header(ws, embed_idx)
 
+    dur_idx: int | None = None
+    if duration_col:
+        dur_idx = _col_index(ws, duration_col)
+        _ensure_header(ws, dur_idx, header="Duration")
+
     driver = _create_driver(headless)
     max_row = ws.max_row
     try:
@@ -388,12 +498,18 @@ def process_excel(
                 continue
             url = str(url).strip()
             print(f"Row {row_num}: {url}")
-            embed = _get_embed(driver, url)
+            embed, duration = _get_embed_and_duration(driver, url)
             if embed:
                 ws.cell(row=row_num, column=embed_idx, value=embed)
                 print(f"  → embed code written ({len(embed)} chars)")
             else:
                 print(f"  → no embed code found", file=sys.stderr)
+            if dur_idx is not None:
+                if duration:
+                    ws.cell(row=row_num, column=dur_idx, value=duration)
+                    print(f"  → duration: {duration}")
+                else:
+                    print(f"  → duration not found", file=sys.stderr)
     finally:
         if driver:
             driver.quit()
@@ -444,6 +560,7 @@ def process_csv(
     url_col: str,
     embed_col: str,
     headless: bool,
+    duration_col: str | None = None,
 ) -> None:
     # Read all rows
     with open(path, newline="", encoding="utf-8-sig") as f:
@@ -464,29 +581,49 @@ def process_csv(
         embed_idx = None
 
     if embed_idx is None or embed_idx >= len(headers):
-        # Append a new column
         embed_idx = len(headers)
         headers.append(embed_col if not embed_col.isdigit() else "Embed Code")
         for row in rows[1:]:
             while len(row) <= embed_idx:
                 row.append("")
 
+    # Resolve duration column; add header if needed
+    dur_idx: int | None = None
+    if duration_col:
+        try:
+            dur_idx = _col_index_csv(headers, duration_col)
+        except ValueError:
+            dur_idx = None
+        if dur_idx is None or dur_idx >= len(headers):
+            dur_idx = len(headers)
+            headers.append(duration_col if not duration_col.isdigit() else "Duration")
+            for row in rows[1:]:
+                while len(row) <= dur_idx:
+                    row.append("")
+
     driver = _create_driver(headless)
 
     try:
         for i, row in enumerate(rows[1:], start=2):
-            while len(row) <= max(url_idx, embed_idx):
+            needed = max(url_idx, embed_idx, dur_idx if dur_idx is not None else 0)
+            while len(row) <= needed:
                 row.append("")
             url = row[url_idx].strip()
             if not url:
                 continue
             print(f"Row {i}: {url}")
-            embed = _get_embed(driver, url)
+            embed, duration = _get_embed_and_duration(driver, url)
             if embed:
                 row[embed_idx] = embed
                 print(f"  → embed code written ({len(embed)} chars)")
             else:
                 print(f"  → no embed code found", file=sys.stderr)
+            if dur_idx is not None:
+                if duration:
+                    row[dur_idx] = duration
+                    print(f"  → duration: {duration}")
+                else:
+                    print(f"  → duration not found", file=sys.stderr)
     finally:
         if driver:
             driver.quit()
@@ -504,25 +641,39 @@ def process_csv(
 # ---------------------------------------------------------------------------
 
 
-def _get_embed(driver, url: str) -> str | None:
+def _get_embed_and_duration(
+    driver, url: str
+) -> tuple[str | None, str | None]:
     """
-    Return an embed HTML string for *url* using:
+    Return ``(embed_html, duration)`` for *url* using:
     1. Browser automation (if selenium is available and driver is provided)
-    2. Programmatic YouTube embed code as a reliable fallback
+    2. Programmatic YouTube embed code + network duration fetch as fallback
     """
+    embed: str | None = None
+    duration: str | None = None
+
     # Try browser first
     if driver:
-        code = get_embed_via_browser(driver, url)
-        if code:
-            return code
+        embed, duration = get_embed_via_browser(driver, url)
 
-    # Programmatic fallback for YouTube
-    video_id = extract_youtube_id(url)
-    if video_id:
-        print("  [fallback] Using programmatic YouTube embed code.")
-        return build_youtube_embed(video_id)
+    # Programmatic fallback for YouTube embed
+    if not embed:
+        video_id = extract_youtube_id(url)
+        if video_id:
+            print("  [fallback] Using programmatic YouTube embed code.")
+            embed = build_youtube_embed(video_id)
 
-    return None
+    # Network fallback for duration (only for YouTube, only if still missing)
+    if duration is None and _is_youtube_url(url):
+        duration = fetch_youtube_duration(url)
+
+    return embed, duration
+
+
+def _get_embed(driver, url: str) -> str | None:
+    """Backward-compatible wrapper – returns embed HTML only."""
+    embed, _ = _get_embed_and_duration(driver, url)
+    return embed
 
 
 # ---------------------------------------------------------------------------
@@ -533,8 +684,8 @@ def _get_embed(driver, url: str) -> str | None:
 def _parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
-            "Extract embed codes from video URLs in a spreadsheet and write "
-            "them back to a configurable column."
+            "Extract embed codes (and optionally video durations) from video URLs "
+            "in a spreadsheet and write them back to configurable columns."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
@@ -542,22 +693,33 @@ def _parse_args(argv=None):
     parser.add_argument("spreadsheet", help="Path to the .xlsx, .xls, or .csv file.")
     parser.add_argument(
         "--url-col",
-        default="1",
+        default="F",
         metavar="COL",
         help=(
             "Column containing video URLs. "
-            "Accepts a 1-based number ('1'), a letter ('A'), or a header name. "
-            "Default: 1"
+            "Accepts a 1-based number ('6'), a letter ('F'), or a header name. "
+            "Default: F"
         ),
     )
     parser.add_argument(
         "--embed-col",
-        default="2",
+        default="O",
         metavar="COL",
         help=(
             "Column where embed code will be written. "
             "Same format as --url-col. "
-            "Default: 2"
+            "Default: O"
+        ),
+    )
+    parser.add_argument(
+        "--duration-col",
+        default="P",
+        metavar="COL",
+        help=(
+            "Column where video duration will be written (e.g. '4:33'). "
+            "Same format as --url-col. "
+            "Set to empty string to disable duration extraction. "
+            "Default: P"
         ),
     )
     parser.add_argument(
@@ -577,6 +739,7 @@ def main(argv=None) -> int:
         return 1
 
     headless = not args.no_headless
+    duration_col = args.duration_col or None  # empty string → None (disabled)
     ext = os.path.splitext(path)[1].lower()
 
     if ext in (".xlsx", ".xls"):
@@ -587,10 +750,10 @@ def main(argv=None) -> int:
                 file=sys.stderr,
             )
             return 1
-        process_excel(path, args.url_col, args.embed_col, headless)
+        process_excel(path, args.url_col, args.embed_col, headless, duration_col)
 
     elif ext == ".csv":
-        process_csv(path, args.url_col, args.embed_col, headless)
+        process_csv(path, args.url_col, args.embed_col, headless, duration_col)
 
     else:
         print(

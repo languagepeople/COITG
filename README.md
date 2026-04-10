@@ -8,11 +8,20 @@ Useful Tools for COITG
 `embed_extractor.py` is an offline script that reads a spreadsheet (Excel or
 CSV), follows each video URL it finds, retrieves the `<iframe>` embed HTML by
 automating the **Share → Embed** flow in a headless browser, and writes the
-result into a separate column on the same row.
+result into a separate column on the same row.  It can also fetch the video
+**duration** and write it to an additional column.
 
 YouTube is the primary target.  When browser automation is unavailable (e.g.
 Chrome is not installed), the script falls back to constructing the standard
 YouTube embed code programmatically from the video ID.
+
+The default column layout matches the COITG course-content spreadsheet:
+
+| Purpose | Default column |
+|---------|---------------|
+| Video URL (input) | **F** |
+| Embed code (output) | **O** |
+| Video duration (output) | **P** |
 
 ### Supported file formats
 
@@ -41,47 +50,52 @@ python embed_extractor.py <spreadsheet> [options]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--url-col COL` | `1` | Column that contains the video URLs. |
-| `--embed-col COL` | `2` | Column where the embed code will be written. |
+| `--url-col COL` | `F` | Column that contains the video URLs. |
+| `--embed-col COL` | `O` | Column where the embed code will be written. |
+| `--duration-col COL` | `P` | Column where the video duration will be written (e.g. `"4:33"`). Pass `""` to disable. |
 | `--no-headless` | *(headless)* | Open a visible browser window (useful for debugging). |
 
 `COL` can be:
-* a **1-based column number** — `1`, `3`, …
-* a **spreadsheet letter** — `A`, `B`, `C`, …
+* a **1-based column number** — `1`, `6`, …
+* a **spreadsheet letter** — `A`, `F`, `O`, …
 * an **exact column header name** — `"Video URL"`, `"Embed Code"`, …
 
 ### Examples
 
 ```bash
-# URLs in column B (2), embed codes written to column C (3)
-python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3
+# Run against the COITG course-content spreadsheet (default columns)
+python embed_extractor.py "Excel Course Content for Moodle.xlsx"
 
-# Use column letters
-python embed_extractor.py videos.xlsx --url-col B --embed-col C
+# Override columns
+python embed_extractor.py videos.xlsx --url-col 2 --embed-col 3 --duration-col 4
 
 # Use header names
-python embed_extractor.py videos.csv --url-col "Video URL" --embed-col "Embed Code"
+python embed_extractor.py videos.csv --url-col "Video URL" \
+    --embed-col "Embed Code" --duration-col "Duration"
 
 # Visible browser window for debugging
 python embed_extractor.py videos.xlsx --no-headless
+
+# Disable duration extraction
+python embed_extractor.py videos.xlsx --duration-col ""
 ```
 
-The spreadsheet is **modified in-place**: the embed code is written directly
-into the specified column and the file is saved.
+The spreadsheet is **modified in-place**: the embed code and duration are
+written directly into the specified columns and the file is saved.
 
 ### Spreadsheet layout example
 
-Before running the script:
+Before running the script (using default columns):
 
-| Title | Video URL | Notes |
-|-------|-----------|-------|
-| My Tutorial | https://www.youtube.com/watch?v=dQw4w9WgXcQ | |
+| … | F (Video URL) | … | O (Embed Code) | P (Duration) |
+|---|--------------|---|----------------|--------------|
+| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | | |
 
-After running `python embed_extractor.py sheet.xlsx --url-col 2 --embed-col 4`:
+After running `python embed_extractor.py sheet.xlsx`:
 
-| Title | Video URL | Notes | Embed Code |
-|-------|-----------|-------|------------|
-| My Tutorial | https://www.youtube.com/watch?v=dQw4w9WgXcQ | | `<iframe width="560" …></iframe>` |
+| … | F (Video URL) | … | O (Embed Code) | P (Duration) |
+|---|--------------|---|----------------|--------------|
+| … | https://www.youtube.com/watch?v=dQw4w9WgXcQ | … | `<iframe …></iframe>` | `3:33` |
 
 ### Running the tests
 
