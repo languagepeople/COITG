@@ -3,6 +3,8 @@ import subprocess
 import argparse
 import re
 import json
+import threading
+import queue
 import nltk
 import torch
 from datetime import datetime
@@ -43,7 +45,7 @@ def sanitize_filename(name: str) -> str:
 
 def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(
-        ["yt-dlp", "--print", "%\(title\)s\t%(duration)s", "--no-playlist", url],
+        ["yt-dlp", "--print", "%{title}\t%{duration}", "--no-playlist", url],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
@@ -59,17 +61,15 @@ def get_video_metadata(url: str) -> dict | None:
     except ValueError:
         return None
 
-def download_audio(url: str, output_path: str) -> bool:
-    print(f"    Downloading audio...")
+def download_audio(url: str, output_path: str):
     result = subprocess.run(
         ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
          "--no-playlist", "-o", output_path, url],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
-        print(f"    ERROR downloading:\n{result.stderr.strip()}")
-        return False
-    return True
+        return False, result.stderr.strip()
+    return True, None
 
 
 # -- Model Loading ------------------------------------------------------------
@@ -78,13 +78,13 @@ def load_model(model_size: str, batch_size: int) -> tuple:
     """
     Load faster-whisper with BatchedInferencePipeline on CUDA.
 
-    The model is downloaded ONCE from HuggingFace and cached permanently at:
+    Model is downloaded once and cached permanently at:
       C:\\Users\\<you>\\.cache\\huggingface\\hub\\
-    On all subsequent runs it loads directly from disk with no re-download.
+    All subsequent runs load from disk with no re-download.
 
     - compute_type="float16" : best speed/accuracy on NVIDIA CUDA GPUs
     - BatchedInferencePipeline: processes multiple audio chunks in parallel
-      giving a 2-4x speed boost over sequential inference.
+      on the GPU, giving a 2-4x speed boost over sequential inference.
     - vad_filter: skips silent sections to reduce wasted compute.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -101,14 +101,13 @@ def load_model(model_size: str, batch_size: int) -> tuple:
     print(f"  Loading model '{model_size}' (cached after first run)...")
     base_model = WhisperModel(model_size, device=device, compute_type=compute_type)
     pipeline = BatchedInferencePipeline(model=base_model)
-    print(f"  Model ready.\n")
+    print("  Model ready.\n")
     return pipeline, batch_size
 
 
 # -- Transcription ------------------------------------------------------------
 
 def transcribe_audio(audio_path: str, pipeline: BatchedInferencePipeline, batch_size: int) -> list[dict]:
-    print(f"    Transcribing...")
     segments, _ = pipeline.transcribe(
         audio_path,
         word_timestamps=True,
@@ -119,7 +118,6 @@ def transcribe_audio(audio_path: str, pipeline: BatchedInferencePipeline, batch_
         ),
         batch_size=batch_size,
     )
-
     sentences_with_times = []
     for segment in segments:
         text = segment.text.strip()
@@ -135,7 +133,6 @@ def transcribe_audio(audio_path: str, pipeline: BatchedInferencePipeline, batch_
             end = sentence_words[-1].end if sentence_words else segment.end
             sentences_with_times.append({"sentence": sentence, "start": start, "end": end})
             word_idx += word_count
-
     return sentences_with_times
 
 
@@ -152,130 +149,208 @@ def save_docx(sentences: list[dict], output_path: str, source_name: str):
         run_ts.bold = True
         paragraph.add_run(item["sentence"])
     doc.save(output_path)
-    print(f"    Saved: {output_path}")
 
 
 # -- Logging ------------------------------------------------------------------
 
+_log_lock = threading.Lock()
+
 def write_log(log_path: str, entry: dict):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry["logged_at"] = timestamp
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write("\n" + "-" * 60 + "\n")
-        f.write(f"  Logged at  : {timestamp}\n")
-        f.write(f"  Status     : {entry.get('status', 'unknown')}\n")
-        f.write(f"  Title      : {entry.get('title', 'N/A')}\n")
-        f.write(f"  URL        : {entry.get('url', 'N/A')}\n")
-        f.write(f"  Duration   : {entry.get('duration_readable', 'N/A')}\n")
-        f.write(f"  Audio file : {entry.get('audio_path', 'N/A')}\n")
-        f.write(f"  Transcript : {entry.get('transcript_path', 'N/A')}\n")
-        if entry.get("error"):
-            f.write(f"  Error      : {entry['error']}\n")
-        f.write(f"  JSON       : {json.dumps(entry)}\n")
+    with _log_lock:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write("\n" + "-" * 60 + "\n")
+            f.write(f"  Logged at  : {timestamp}\n")
+            f.write(f"  Status     : {entry.get('status', 'unknown')}\n")
+            f.write(f"  Title      : {entry.get('title', 'N/A')}\n")
+            f.write(f"  URL        : {entry.get('url', 'N/A')}\n")
+            f.write(f"  Duration   : {entry.get('duration_readable', 'N/A')}\n")
+            f.write(f"  Audio file : {entry.get('audio_path', 'N/A')}\n")
+            f.write(f"  Transcript : {entry.get('transcript_path', 'N/A')}\n")
+            if entry.get("error"):
+                f.write(f"  Error      : {entry['error']}\n")
+            f.write(f"  JSON       : {json.dumps(entry)}\n")
 
 
-# -- Core Processing ----------------------------------------------------------
+# -- Pipelined Processing -----------------------------------------------------
 
-def process_audio_file(audio_path, output_dir, pipeline, batch_size, skip_existing, log_path, url="N/A"):
-    stem = Path(audio_path).stem
-    output_path = os.path.join(output_dir, f"{stem}.docx")
-    log_entry = {
-        "url": url, "title": stem,
-        "audio_path": str(Path(audio_path).resolve()),
-        "transcript_path": str(Path(output_path).resolve()),
-        "duration_raw": None, "duration_readable": "N/A",
-        "status": None, "error": None,
-    }
-    if skip_existing and os.path.exists(output_path):
-        print(f"    Skipping -- transcript already exists: {output_path}")
-        log_entry["status"] = "skipped"
-        write_log(log_path, log_entry)
-        return True
-    sentences = transcribe_audio(audio_path, pipeline, batch_size)
-    if not sentences:
-        print(f"    WARNING: Empty transcription.")
-        log_entry["status"] = "failed"
-        log_entry["error"] = "Empty transcription result"
-        write_log(log_path, log_entry)
-        return False
-    save_docx(sentences, output_path, stem)
-    log_entry["status"] = "success"
-    write_log(log_path, log_entry)
-    return True
+_DONE = object()
+
+def _downloader_thread(jobs, audio_dir, log_path, ready_queue):
+    """
+    Background thread: downloads audio for each job and puts a work item
+    onto ready_queue for the main thread to transcribe.
+
+    The queue is bounded so the downloader stays at most `prefetch` videos
+    ahead of the transcriber -- preventing disk from filling up.
+    """
+    for row_num, url, meta in jobs:
+        title      = meta["title"]
+        duration   = meta["duration"]
+        audio_path = os.path.join(audio_dir, f"{title}.mp3")
+
+        log_base = {
+            "url": url,
+            "title": title,
+            "audio_path": str(Path(audio_path).resolve()),
+            "transcript_path": None,
+            "duration_raw": duration,
+            "duration_readable": format_duration(duration),
+            "status": None,
+            "error": None,
+        }
+
+        if os.path.exists(audio_path):
+            print(f"  [DL] {title} -- audio already on disk.")
+            ready_queue.put({"job": (row_num, url, meta), "audio_path": audio_path,
+                             "log_base": log_base, "error": None})
+            continue
+
+        print(f"  [DL] Downloading: {title}  ({format_duration(duration)})")
+        success, err = download_audio(url, audio_path)
+        if not success:
+            print(f"  [DL] ERROR: {title}\n       {err}")
+            log_base["status"] = "failed"
+            log_base["error"]  = f"Audio download failed: {err}"
+            write_log(log_path, log_base)
+            ready_queue.put({"job": (row_num, url, meta), "audio_path": None,
+                             "log_base": log_base, "error": err})
+        else:
+            print(f"  [DL] Ready: {title}")
+            ready_queue.put({"job": (row_num, url, meta), "audio_path": audio_path,
+                             "log_base": log_base, "error": None})
+
+    ready_queue.put(_DONE)
 
 
-def process_spreadsheet(xlsx_path, audio_dir, output_dir, pipeline, batch_size, skip_existing, log_path):
+def process_spreadsheet_pipelined(
+    xlsx_path, audio_dir, output_dir, pipeline, batch_size,
+    skip_existing, log_path, prefetch=3
+):
+    """
+    Pipelined spreadsheet processing:
+      - A background thread downloads audio files (up to `prefetch` ahead).
+      - The main thread transcribes each file as soon as it is ready.
+      - Net effect: GPU is almost never idle waiting for a download.
+
+    prefetch=3 means up to 3 audio files sit on disk waiting to be
+    transcribed. Increase if your internet is faster than your GPU;
+    decrease if you are short on disk space.
+    """
     wb = load_workbook(xlsx_path)
     ws = wb.active
     URL_COL = 5  # Column F (zero-based)
-    rows = [
+
+    print("Scanning spreadsheet and fetching metadata...")
+    jobs   = []
+    failed = []
+
+    raw_rows = [
         (i + 1, str(row[URL_COL].value).strip())
         for i, row in enumerate(ws.iter_rows())
         if row[URL_COL].value and str(row[URL_COL].value).strip().startswith("http")
     ]
-    if not rows:
+
+    if not raw_rows:
         print("No URLs found in column F of the spreadsheet.")
         return
-    total = len(rows)
-    print(f"\nFound {total} URL(s) in spreadsheet. Starting...\n")
-    failed = []
-    for row_num, url in rows:
-        print(f"[Row {row_num}/{total}] {url}")
-        log_entry = {
-            "url": url, "title": None, "audio_path": None, "transcript_path": None,
-            "duration_raw": None, "duration_readable": None, "status": None, "error": None,
-        }
-        print(f"    Fetching metadata...")
+
+    total_rows = len(raw_rows)
+    print(f"Found {total_rows} URL(s). Fetching metadata...\n")
+
+    for row_num, url in raw_rows:
         meta = get_video_metadata(url)
         if not meta:
-            print(f"    ERROR: Could not fetch metadata. Skipping.")
-            log_entry["status"] = "failed"
-            log_entry["error"] = "Could not fetch video metadata"
-            write_log(log_path, log_entry)
+            print(f"  [META] Row {row_num}: Could not fetch metadata -- {url}")
             failed.append((row_num, url, "Could not fetch metadata"))
+            write_log(log_path, {
+                "url": url, "title": None, "audio_path": None, "transcript_path": None,
+                "duration_raw": None, "duration_readable": None,
+                "status": "failed", "error": "Could not fetch video metadata",
+            })
             continue
-        title = meta["title"]
-        duration = meta["duration"]
-        audio_path = os.path.join(audio_dir, f"{title}.mp3")
+
+        title       = meta["title"]
         output_path = os.path.join(output_dir, f"{title}.docx")
-        log_entry["title"] = title
-        log_entry["duration_raw"] = duration
-        log_entry["duration_readable"] = format_duration(duration)
-        log_entry["audio_path"] = str(Path(audio_path).resolve())
-        log_entry["transcript_path"] = str(Path(output_path).resolve())
-        print(f"    Title    : {title}")
-        print(f"    Duration : {format_duration(duration)}")
+
         if skip_existing and os.path.exists(output_path):
-            print(f"    Skipping -- transcript already exists.\n")
-            log_entry["status"] = "skipped"
-            write_log(log_path, log_entry)
+            print(f"  [SKIP] Row {row_num}: {title}")
+            write_log(log_path, {
+                "url": url, "title": title,
+                "audio_path": str(Path(os.path.join(audio_dir, f"{title}.mp3")).resolve()),
+                "transcript_path": str(Path(output_path).resolve()),
+                "duration_raw": meta["duration"],
+                "duration_readable": format_duration(meta["duration"]),
+                "status": "skipped", "error": None,
+            })
             continue
-        if not os.path.exists(audio_path):
-            success = download_audio(url, audio_path)
-            if not success:
-                log_entry["status"] = "failed"
-                log_entry["error"] = "Audio download failed"
-                write_log(log_path, log_entry)
-                failed.append((row_num, url, "Download failed"))
-                continue
-        else:
-            print(f"    Audio already on disk, skipping download.")
+
+        jobs.append((row_num, url, meta))
+
+    if not jobs:
+        print("\nNothing left to process (all skipped or failed metadata).")
+        _print_summary(total_rows, failed, log_path)
+        return
+
+    total_to_process = len(jobs)
+    print(f"\n{total_to_process} video(s) to download and transcribe.")
+    print("Starting pipelined download + transcription...")
+    print("  [DL] = downloader thread      [TX] = transcriber (GPU)\n")
+
+    ready_queue = queue.Queue(maxsize=prefetch)
+    dl_thread = threading.Thread(
+        target=_downloader_thread,
+        args=(jobs, audio_dir, log_path, ready_queue),
+        daemon=True,
+    )
+    dl_thread.start()
+
+    completed = 0
+    while True:
+        item = ready_queue.get()
+        if item is _DONE:
+            break
+
+        row_num, url, meta = item["job"]
+        audio_path         = item["audio_path"]
+        log_base           = item["log_base"]
+        dl_error           = item["error"]
+        title              = meta["title"]
+        output_path        = os.path.join(output_dir, f"{title}.docx")
+
+        log_base["transcript_path"] = str(Path(output_path).resolve())
+
+        completed += 1
+        print(f"  [TX] ({completed}/{total_to_process}) Transcribing: {title}")
+
+        if dl_error:
+            failed.append((row_num, url, "Download failed"))
+            continue
+
         sentences = transcribe_audio(audio_path, pipeline, batch_size)
         if not sentences:
-            print(f"    WARNING: Empty transcription.")
-            log_entry["status"] = "failed"
-            log_entry["error"] = "Empty transcription result"
-            write_log(log_path, log_entry)
+            print(f"  [TX] WARNING: Empty transcription for {title}")
+            log_base["status"] = "failed"
+            log_base["error"]  = "Empty transcription result"
+            write_log(log_path, log_base)
             failed.append((row_num, url, "Empty transcription"))
             continue
+
         save_docx(sentences, output_path, title)
-        log_entry["status"] = "success"
-        write_log(log_path, log_entry)
-        print(f"    Done.\n")
+        log_base["status"] = "success"
+        write_log(log_path, log_base)
+        print(f"  [TX] Done: {output_path}\n")
+
+    dl_thread.join()
+    _print_summary(total_rows, failed, log_path)
+
+
+def _print_summary(total, failed, log_path):
     print("\n" + "=" * 50)
-    print(f"Completed: {total - len(failed)}/{total} rows")
+    print(f"Completed: {total - len(failed)}/{total}")
     if failed:
-        print(f"\nFailed rows:")
+        print(f"\nFailed ({len(failed)}):")
         for row_num, url, reason in failed:
             print(f"  Row {row_num}: {reason} -- {url}")
     else:
@@ -284,9 +359,11 @@ def process_spreadsheet(xlsx_path, audio_dir, output_dir, pipeline, batch_size, 
     print(f"\nLog written to: {log_path}")
 
 
+# -- Directory mode -----------------------------------------------------------
 def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing, log_path):
     extensions = {".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".flac", ".webm"}
-    files = sorted([f for f in Path(audio_dir).iterdir() if f.is_file() and f.suffix.lower() in extensions])
+    files = sorted([f for f in Path(audio_dir).iterdir()
+                    if f.is_file() and f.suffix.lower() in extensions])
     if not files:
         print(f"No audio files found in: {audio_dir}")
         return
@@ -294,11 +371,35 @@ def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing
     print(f"\nFound {total} audio file(s). Starting...\n")
     failed = []
     for i, audio_file in enumerate(files, 1):
+        stem        = audio_file.stem
+        output_path = os.path.join(output_dir, f"{stem}.docx")
         print(f"[{i}/{total}] {audio_file.name}")
-        success = process_audio_file(str(audio_file), output_dir, pipeline, batch_size, skip_existing, log_path)
-        if not success:
+        log_entry = {
+            "url": "N/A", "title": stem,
+            "audio_path": str(audio_file.resolve()),
+            "transcript_path": str(Path(output_path).resolve()),
+            "duration_raw": None, "duration_readable": "N/A",
+            "status": None, "error": None,
+        }
+        if skip_existing and os.path.exists(output_path):
+            print(f"    Skipping -- transcript already exists.")
+            log_entry["status"] = "skipped"
+            write_log(log_path, log_entry)
+            print()
+            continue
+        sentences = transcribe_audio(str(audio_file), pipeline, batch_size)
+        if not sentences:
+            print(f"    WARNING: Empty transcription.")
+            log_entry["status"] = "failed"
+            log_entry["error"]  = "Empty transcription result"
+            write_log(log_path, log_entry)
             failed.append(audio_file.name)
-        print()
+            print()
+            continue
+        save_docx(sentences, output_path, stem)
+        log_entry["status"] = "success"
+        write_log(log_path, log_entry)
+        print(f"    Saved: {output_path}\n")
     print("=" * 50)
     print(f"Completed: {total - len(failed)}/{total} files")
     if failed:
@@ -312,26 +413,31 @@ def process_directory(audio_dir, output_dir, pipeline, batch_size, skip_existing
 
 
 # -- CLI Entry Point ----------------------------------------------------------
-
 def main():
     parser = argparse.ArgumentParser(
-        description="YouTube Audio Transcriber -> DOCX with timestamps (faster-whisper + CUDA)"
+        description="YouTube Audio Transcriber -> DOCX with timestamps (faster-whisper + CUDA, pipelined)"
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--spreadsheet", "-s", help="Path to .xlsx file with YouTube URLs in column F.")
-    group.add_argument("--directory", "-d", help="Path to a directory of audio files to transcribe.")
-    parser.add_argument("--audio-dir", "-a", default="./audio", help="Where to save downloaded audio. (default: ./audio)")
-    parser.add_argument("--output-dir", "-o", default="./transcripts", help="Where to save .docx files. (default: ./transcripts)")
-    parser.add_argument("--log-file", "-l", default="./transcription_log.txt", help="Path to the log file. (default: ./transcription_log.txt)")
+    group.add_argument("--directory",   "-d", help="Path to a directory of audio files to transcribe.")
+    parser.add_argument("--audio-dir",  "-a", default="./audio",
+                        help="Where to save downloaded audio. (default: ./audio)")
+    parser.add_argument("--output-dir", "-o", default="./transcripts",
+                        help="Where to save .docx files. (default: ./transcripts)")
+    parser.add_argument("--log-file",   "-l", default="./transcription_log.txt",
+                        help="Path to the log file. (default: ./transcription_log.txt)")
     parser.add_argument("--model", "-m", default="large-v2",
-        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
-        help="Whisper model size. (default: large-v2)")
+                        choices=["tiny", "base", "small", "medium", "large-v1", "large-v2", "large-v3"],
+                        help="Whisper model size. (default: large-v2)")
     parser.add_argument("--batch-size", "-b", type=int, default=16,
-        help="Number of audio chunks processed in parallel on GPU. Reduce if you run out of VRAM. (default: 16)")
-    parser.add_argument("--no-skip", action="store_true", help="Re-transcribe even if a .docx already exists.")
+                        help="GPU chunks processed in parallel. Reduce if you run out of VRAM. (default: 16)")
+    parser.add_argument("--prefetch", "-p", type=int, default=3,
+                        help="Audio files to download ahead of transcription. (default: 3)")
+    parser.add_argument("--no-skip", action="store_true",
+                        help="Re-transcribe even if a .docx already exists.")
 
     args = parser.parse_args()
-    os.makedirs(args.audio_dir, exist_ok=True)
+    os.makedirs(args.audio_dir,  exist_ok=True)
     os.makedirs(args.output_dir, exist_ok=True)
 
     with open(args.log_file, "a", encoding="utf-8") as f:
@@ -343,6 +449,7 @@ def main():
         f.write(f"  Output dir   : {Path(args.output_dir).resolve()}\n")
         f.write(f"  Whisper model: {args.model}\n")
         f.write(f"  Batch size   : {args.batch_size}\n")
+        f.write(f"  Prefetch     : {args.prefetch}\n")
         f.write(f"  Skip existing: {not args.no_skip}\n")
         f.write("=" * 60 + "\n")
 
@@ -350,9 +457,16 @@ def main():
     pipeline, batch_size = load_model(args.model, args.batch_size)
 
     if args.spreadsheet:
-        process_spreadsheet(args.spreadsheet, args.audio_dir, args.output_dir, pipeline, batch_size, not args.no_skip, args.log_file)
+        process_spreadsheet_pipelined(
+            args.spreadsheet, args.audio_dir, args.output_dir,
+            pipeline, batch_size, not args.no_skip, args.log_file,
+            prefetch=args.prefetch,
+        )
     elif args.directory:
-        process_directory(args.directory, args.output_dir, pipeline, batch_size, not args.no_skip, args.log_file)
+        process_directory(
+            args.directory, args.output_dir,
+            pipeline, batch_size, not args.no_skip, args.log_file,
+        )
 
 
 if __name__ == "__main__":
