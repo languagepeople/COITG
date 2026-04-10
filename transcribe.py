@@ -210,14 +210,42 @@ def write_log(log_path: str, entry: dict):
 
 _DONE = object()
 
-def _downloader_thread(jobs, audio_dir, log_path, ready_queue):
-    for row_num, url, meta in jobs:
+def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue):
+    for row_num, url in pending_rows:
         if _stop.is_set():
             break
+
+        meta = get_video_metadata(url)
+        if not meta:
+            print(f"  [DL] Row {row_num}: Could not fetch metadata -- {url}")
+            write_log(log_path, {
+                "url": url, "title": None, "audio_path": None, "transcript_path": None,
+                "duration_raw": None, "duration_readable": None,
+                "status": "failed", "error": "Could not fetch video metadata",
+            })
+            ready_queue.put({"job": (row_num, url, None), "audio_path": None,
+                             "log_base": None, "error": "Could not fetch video metadata",
+                             "meta_error": True})
+            continue
 
         title      = meta["title"]
         duration   = meta["duration"]
         audio_path = os.path.join(audio_dir, f"{title}.mp3")
+
+        if skip_existing:
+            output_path = os.path.join(output_dir, f"{title}.docx")
+            if os.path.exists(output_path):
+                print(f"  [DL] Row {row_num}: {title} -- output already exists, skipping.")
+                ready_queue.put({"job": (row_num, url, meta), "audio_path": None,
+                                 "log_base": {
+                                     "url": url, "title": title,
+                                     "audio_path": str(Path(audio_path).resolve()),
+                                     "transcript_path": str(Path(output_path).resolve()),
+                                     "duration_raw": duration,
+                                     "duration_readable": format_duration(duration),
+                                     "status": "skipped", "error": None,
+                                 }, "error": None, "skipped": True})
+                continue
 
         log_base = {
             "url": url, "title": title,
@@ -264,8 +292,7 @@ def process_spreadsheet_pipelined(
     if completed_urls:
         print(f"  Resuming -- {len(completed_urls)} URL(s) already completed (from progress file).\n")
 
-    print("Scanning spreadsheet and fetching metadata...")
-    jobs   = []
+    print("Scanning spreadsheet...")
     failed = []
 
     raw_rows = [
@@ -279,50 +306,21 @@ def process_spreadsheet_pipelined(
         return
 
     total_rows = len(raw_rows)
-    print(f"Found {total_rows} URL(s). Fetching metadata...\n")
+    print(f"Found {total_rows} URL(s).\n")
 
+    pending_rows = []
     for row_num, url in raw_rows:
         if url in completed_urls:
             print(f"  [RESUME] Row {row_num}: already completed -- skipping.")
             continue
+        pending_rows.append((row_num, url))
 
-        meta = get_video_metadata(url)
-        if not meta:
-            print(f"  [META] Row {row_num}: Could not fetch metadata -- {url}")
-            failed.append((row_num, url, "Could not fetch metadata"))
-            write_log(log_path, {
-                "url": url, "title": None, "audio_path": None, "transcript_path": None,
-                "duration_raw": None, "duration_readable": None,
-                "status": "failed", "error": "Could not fetch video metadata",
-            })
-            continue
-
-        title       = meta["title"]
-        output_path = os.path.join(output_dir, f"{title}.docx")
-
-        if skip_existing and os.path.exists(output_path):
-            print(f"  [SKIP] Row {row_num}: {title}")
-            completed_urls.add(url)
-            save_progress(progress_path, completed_urls)
-            write_log(log_path, {
-                "url": url, "title": title,
-                "audio_path": str(Path(os.path.join(audio_dir, f"{title}.mp3")).resolve()),
-                "transcript_path": str(Path(output_path).resolve()),
-                "duration_raw": meta["duration"],
-                "duration_readable": format_duration(meta["duration"]),
-                "status": "skipped", "error": None,
-            })
-            continue
-
-        jobs.append((row_num, url, meta))
-
-    if not jobs:
-        print("\nNothing left to process (all skipped, resumed, or failed metadata).")
+    if not pending_rows:
+        print("\nNothing left to process (all URLs already completed).")
         _print_summary(total_rows, failed, log_path, progress_path)
         return
 
-    total_to_process = len(jobs)
-    print(f"\n{total_to_process} video(s) to download and transcribe.")
+    print(f"\n{len(pending_rows)} URL(s) to process.")
     print("Starting pipelined download + transcription...")
     print("  [DL] = downloader thread      [TX] = transcriber (GPU)")
     print("  Press CTRL+C once to stop gracefully after current video.\n")
@@ -330,7 +328,7 @@ def process_spreadsheet_pipelined(
     ready_queue = queue.Queue(maxsize=prefetch)
     dl_thread = threading.Thread(
         target=_downloader_thread,
-        args=(jobs, audio_dir, log_path, ready_queue),
+        args=(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue),
         daemon=True,
     )
     dl_thread.start()
@@ -349,6 +347,17 @@ def process_spreadsheet_pipelined(
             break
 
         row_num, url, meta = item["job"]
+
+        if item.get("meta_error"):
+            failed.append((row_num, url, "Could not fetch video metadata"))
+            continue
+
+        if item.get("skipped"):
+            write_log(log_path, item["log_base"])
+            completed_urls.add(url)
+            save_progress(progress_path, completed_urls)
+            continue
+
         audio_path         = item["audio_path"]
         log_base           = item["log_base"]
         dl_error           = item["error"]
@@ -358,7 +367,7 @@ def process_spreadsheet_pipelined(
         log_base["transcript_path"] = str(Path(output_path).resolve())
 
         completed += 1
-        print(f"  [TX] ({completed}/{total_to_process}) Transcribing: {title}")
+        print(f"  [TX] ({completed}) Transcribing: {title}")
 
         if dl_error:
             failed.append((row_num, url, "Download failed"))
@@ -386,8 +395,7 @@ def process_spreadsheet_pipelined(
     dl_thread.join(timeout=2)
 
     if stopped_early:
-        remaining = total_to_process - completed
-        print(f"  Stopped with {remaining} video(s) remaining.")
+        print(f"  Stopped early.")
         print(f"  Progress saved to: {progress_path}")
         print(f"  Run the same command again to resume from where you left off.\n")
 
