@@ -65,7 +65,8 @@ def sanitize_filename(name: str) -> str:
 
 def get_video_metadata(url: str) -> dict | None:
     result = subprocess.run(
-        ["yt-dlp", "--print", "%(title)s\t%(duration)s", "--no-playlist", url],
+        ["yt-dlp", "--cookies-from-browser", "chrome",
+         "--print", "%(title)s\t%(duration)s", "--no-playlist", url],
         capture_output=True, text=True,
     )
     if result.returncode != 0 or not result.stdout.strip():
@@ -83,7 +84,8 @@ def get_video_metadata(url: str) -> dict | None:
 
 def download_audio(url: str, output_path: str):
     result = subprocess.run(
-        ["yt-dlp", "-x", "--audio-format", "mp3", "--audio-quality", "0",
+        ["yt-dlp", "--cookies-from-browser", "chrome",
+         "-x", "--audio-format", "mp3", "--audio-quality", "0",
          "--no-playlist", "-o", output_path, url],
         capture_output=True, text=True,
     )
@@ -210,8 +212,8 @@ def write_log(log_path: str, entry: dict):
 
 _DONE = object()
 
-def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue):
-    for row_num, url in pending_rows:
+def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue, download_only=False):
+    for row_num, url, course_name in pending_rows:
         if _stop.is_set():
             break
 
@@ -223,20 +225,23 @@ def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_p
                 "duration_raw": None, "duration_readable": None,
                 "status": "failed", "error": "Could not fetch video metadata",
             })
-            ready_queue.put({"job": (row_num, url, None), "audio_path": None,
+            ready_queue.put({"job": (row_num, url, None, course_name), "audio_path": None,
                              "log_base": None, "error": "Could not fetch video metadata",
                              "meta_error": True})
             continue
 
-        title      = meta["title"]
-        duration   = meta["duration"]
-        audio_path = os.path.join(audio_dir, f"{title}.mp3")
+        title             = meta["title"]
+        duration          = meta["duration"]
+        course_audio_dir  = os.path.join(audio_dir, course_name)
+        os.makedirs(course_audio_dir, exist_ok=True)
+        audio_path        = os.path.join(course_audio_dir, f"{title}.mp3")
 
-        if skip_existing:
-            output_path = os.path.join(output_dir, f"{title}.docx")
+        if skip_existing and not download_only:
+            course_output_dir = os.path.join(output_dir, course_name)
+            output_path = os.path.join(course_output_dir, f"{title}.docx")
             if os.path.exists(output_path):
                 print(f"  [DL] Row {row_num}: {title} -- output already exists, skipping.")
-                ready_queue.put({"job": (row_num, url, meta), "audio_path": None,
+                ready_queue.put({"job": (row_num, url, meta, course_name), "audio_path": None,
                                  "log_base": {
                                      "url": url, "title": title,
                                      "audio_path": str(Path(audio_path).resolve()),
@@ -258,7 +263,10 @@ def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_p
 
         if os.path.exists(audio_path):
             print(f"  [DL] {title} -- audio already on disk.")
-            ready_queue.put({"job": (row_num, url, meta), "audio_path": audio_path,
+            if download_only:
+                log_base["status"] = "downloaded"
+                write_log(log_path, log_base)
+            ready_queue.put({"job": (row_num, url, meta, course_name), "audio_path": audio_path,
                              "log_base": log_base, "error": None})
             continue
 
@@ -269,11 +277,14 @@ def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_p
             log_base["status"] = "failed"
             log_base["error"]  = f"Audio download failed: {err}"
             write_log(log_path, log_base)
-            ready_queue.put({"job": (row_num, url, meta), "audio_path": None,
+            ready_queue.put({"job": (row_num, url, meta, course_name), "audio_path": None,
                              "log_base": log_base, "error": err})
         else:
             print(f"  [DL] Ready: {title}")
-            ready_queue.put({"job": (row_num, url, meta), "audio_path": audio_path,
+            if download_only:
+                log_base["status"] = "downloaded"
+                write_log(log_path, log_base)
+            ready_queue.put({"job": (row_num, url, meta, course_name), "audio_path": audio_path,
                              "log_base": log_base, "error": None})
 
     ready_queue.put(_DONE)
@@ -281,11 +292,12 @@ def _downloader_thread(pending_rows, audio_dir, output_dir, skip_existing, log_p
 
 def process_spreadsheet_pipelined(
     xlsx_path, audio_dir, output_dir, pipeline, batch_size,
-    skip_existing, log_path, progress_path, prefetch=3
+    skip_existing, log_path, progress_path, prefetch=3, download_only=False
 ):
     wb = load_workbook(xlsx_path)
     ws = wb.active
-    URL_COL = 5  # Column F (zero-based)
+    URL_COL    = 5  # Column F (zero-based)
+    COURSE_COL = 4  # Column E (zero-based)
 
     # Load previously completed URLs
     completed_urls = load_progress(progress_path)
@@ -296,7 +308,11 @@ def process_spreadsheet_pipelined(
     failed = []
 
     raw_rows = [
-        (i + 1, str(row[URL_COL].value).strip())
+        (
+            i + 1,
+            str(row[URL_COL].value).strip(),
+            sanitize_filename(str(row[COURSE_COL].value).strip()) if row[COURSE_COL].value else "Uncategorised",
+        )
         for i, row in enumerate(ws.iter_rows())
         if row[URL_COL].value and str(row[URL_COL].value).strip().startswith("http")
     ]
@@ -309,11 +325,11 @@ def process_spreadsheet_pipelined(
     print(f"Found {total_rows} URL(s).\n")
 
     pending_rows = []
-    for row_num, url in raw_rows:
+    for row_num, url, course_name in raw_rows:
         if url in completed_urls:
             print(f"  [RESUME] Row {row_num}: already completed -- skipping.")
             continue
-        pending_rows.append((row_num, url))
+        pending_rows.append((row_num, url, course_name))
 
     if not pending_rows:
         print("\nNothing left to process (all URLs already completed).")
@@ -321,14 +337,17 @@ def process_spreadsheet_pipelined(
         return
 
     print(f"\n{len(pending_rows)} URL(s) to process.")
-    print("Starting pipelined download + transcription...")
+    if download_only:
+        print("Starting download-only run (no transcription)...")
+    else:
+        print("Starting pipelined download + transcription...")
     print("  [DL] = downloader thread      [TX] = transcriber (GPU)")
     print("  Press CTRL+C once to stop gracefully after current video.\n")
 
     ready_queue = queue.Queue(maxsize=prefetch)
     dl_thread = threading.Thread(
         target=_downloader_thread,
-        args=(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue),
+        args=(pending_rows, audio_dir, output_dir, skip_existing, log_path, ready_queue, download_only),
         daemon=True,
     )
     dl_thread.start()
@@ -346,7 +365,7 @@ def process_spreadsheet_pipelined(
             stopped_early = True
             break
 
-        row_num, url, meta = item["job"]
+        row_num, url, meta, course_name = item["job"]
 
         if item.get("meta_error"):
             failed.append((row_num, url, "Could not fetch video metadata"))
@@ -358,15 +377,29 @@ def process_spreadsheet_pipelined(
             save_progress(progress_path, completed_urls)
             continue
 
-        audio_path         = item["audio_path"]
-        log_base           = item["log_base"]
-        dl_error           = item["error"]
-        title              = meta["title"]
-        output_path        = os.path.join(output_dir, f"{title}.docx")
+        audio_path = item["audio_path"]
+        log_base   = item["log_base"]
+        dl_error   = item["error"]
+        title      = meta["title"]
+
+        course_output_dir = os.path.join(output_dir, course_name)
+        os.makedirs(course_output_dir, exist_ok=True)
+        output_path = os.path.join(course_output_dir, f"{title}.docx")
 
         log_base["transcript_path"] = str(Path(output_path).resolve())
 
         completed += 1
+
+        if download_only:
+            if dl_error:
+                failed.append((row_num, url, "Download failed"))
+                continue
+            # Log already written by downloader; just mark progress
+            completed_urls.add(url)
+            save_progress(progress_path, completed_urls)
+            print(f"  [DL] ({completed}) Downloaded: {title}\n")
+            continue
+
         print(f"  [TX] ({completed}) Transcribing: {title}")
 
         if dl_error:
@@ -503,6 +536,9 @@ def main():
                         help="Re-transcribe even if a .docx already exists.")
     parser.add_argument("--reset-progress", action="store_true",
                         help="Delete the progress file and start from scratch.")
+    parser.add_argument("--download-only", action="store_true",
+                        help="Download audio only -- do not load Whisper or transcribe. "
+                             "Only valid with --spreadsheet.")
 
     args = parser.parse_args()
     os.makedirs(args.audio_dir,  exist_ok=True)
@@ -523,25 +559,39 @@ def main():
     with open(args.log_file, "a", encoding="utf-8") as f:
         f.write("\n" + "=" * 60 + "\n")
         f.write(f"  SESSION START: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"  Mode         : {'spreadsheet' if args.spreadsheet else 'directory'}\n")
+        if args.spreadsheet:
+            mode_label = "download-only" if args.download_only else "spreadsheet"
+        else:
+            mode_label = "directory"
+        f.write(f"  Mode         : {mode_label}\n")
         f.write(f"  Input        : {args.spreadsheet or args.directory}\n")
         f.write(f"  Audio dir    : {Path(args.audio_dir).resolve()}\n")
         f.write(f"  Output dir   : {Path(args.output_dir).resolve()}\n")
-        f.write(f"  Whisper model: {args.model}\n")
-        f.write(f"  Batch size   : {args.batch_size}\n")
+        if not args.download_only:
+            f.write(f"  Whisper model: {args.model}\n")
+            f.write(f"  Batch size   : {args.batch_size}\n")
+        else:
+            f.write(f"  Whisper model: N/A\n")
+            f.write(f"  Batch size   : N/A\n")
         f.write(f"  Prefetch     : {args.prefetch}\n")
         f.write(f"  Skip existing: {not args.no_skip}\n")
         f.write(f"  Progress file: {progress_path}\n")
         f.write("=" * 60 + "\n")
 
-    print(f"Loading faster-whisper model '{args.model}'...")
-    pipeline, batch_size = load_model(args.model, args.batch_size)
+    if args.download_only and not args.spreadsheet:
+        parser.error("--download-only requires --spreadsheet")
+
+    if not args.download_only:
+        print(f"Loading faster-whisper model '{args.model}'...")
+        pipeline, batch_size = load_model(args.model, args.batch_size)
+    else:
+        pipeline, batch_size = None, None
 
     if args.spreadsheet:
         process_spreadsheet_pipelined(
             args.spreadsheet, args.audio_dir, args.output_dir,
             pipeline, batch_size, not args.no_skip, args.log_file,
-            progress_path, prefetch=args.prefetch,
+            progress_path, prefetch=args.prefetch, download_only=args.download_only,
         )
     elif args.directory:
         process_directory(
